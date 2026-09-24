@@ -114,6 +114,31 @@ function Get-Slug([string]$Name, [string]$Codpro) {
   return "$s-$id"
 }
 
+function Get-ImageContentType([string]$Extension) {
+  switch ($Extension.ToLowerInvariant()) {
+    ".png" { return "image/png" }
+    ".gif" { return "image/gif" }
+    ".webp" { return "image/webp" }
+    ".bmp" { return "image/bmp" }
+    default { return "image/jpeg" }
+  }
+}
+
+function Get-ImageObjectName([string]$Codpro, [string]$Extension) {
+  $safe = [regex]::Replace($Codpro, "[^A-Za-z0-9._-]", "")
+  if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "image" }
+  return $safe + $Extension.ToLowerInvariant()
+}
+
+function Test-StorageObject([string]$ObjectName) {
+  $uri = $script:SupabaseUrl.TrimEnd("/") + "/storage/v1/object/product-images/" + [uri]::EscapeDataString($ObjectName)
+  $req = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Head), $uri
+  [void]$req.Headers.TryAddWithoutValidation("apikey", $script:ServiceKey)
+  [void]$req.Headers.TryAddWithoutValidation("Authorization", "Bearer $($script:ServiceKey)")
+  $resp = $script:Http.SendAsync($req).GetAwaiter().GetResult()
+  return [bool]$resp.IsSuccessStatusCode
+}
+
 function Read-OdbcRows($Connection, [string]$Sql) {
   $cmd = $Connection.CreateCommand()
   $cmd.CommandText = $Sql
@@ -286,6 +311,12 @@ try {
     }
   }
   $images = 0
+  $photoIndex = @{}
+  if ($FullSync -and (Test-Path -LiteralPath $PhotoDir)) {
+    Get-ChildItem -LiteralPath $PhotoDir -File | ForEach-Object {
+      $photoIndex[$_.Name.ToLowerInvariant()] = $_.FullName
+    }
+  }
 
   foreach ($row in $produits) {
     $id = To-Text $row.CODPRO
@@ -322,33 +353,47 @@ try {
       if ($unitCode -and $uniBy.ContainsKey($unitCode)) { $unit = $uniBy[$unitCode] }
       $descr = To-Text $row.DESCR
       $imageUrl = $null
-      $photo = Join-Path $PhotoDir ($id + ".jpg")
-      if (Test-Path -LiteralPath $photo) {
-        $item = Get-Item -LiteralPath $photo
-        $stamp = $item.LastWriteTimeUtc.ToString("o")
-        $fileName = [uri]::EscapeDataString($id) + ".jpg"
-        if ($imageState[$id] -ne $stamp) {
-          try {
-            $bytes = [IO.File]::ReadAllBytes($photo)
-            $upload = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Post), ($script:SupabaseUrl.TrimEnd("/") + "/storage/v1/object/product-images/" + $fileName)
-            [void]$upload.Headers.TryAddWithoutValidation("apikey", $script:ServiceKey)
-            [void]$upload.Headers.TryAddWithoutValidation("Authorization", "Bearer $($script:ServiceKey)")
-            [void]$upload.Headers.TryAddWithoutValidation("x-upsert", "true")
-            $content = New-Object System.Net.Http.ByteArrayContent (,$bytes)
-            $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("image/jpeg")
-            $upload.Content = $content
-            $uploadResp = $script:Http.SendAsync($upload).GetAwaiter().GetResult()
-            $uploadText = $uploadResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            if (-not $uploadResp.IsSuccessStatusCode) { throw $uploadText }
-            $imageState[$id] = $stamp
-            $images++
-          } catch {
-            $errors++
-            Write-Log "Image $id : $($_.Exception.Message)" "ERROR"
+      $imafic = To-Text $row.IMAFIC
+      $leaf = ""
+      if ($imafic) { $leaf = [IO.Path]::GetFileName($imafic) }
+      $photo = $null
+      if ($leaf -and $photoIndex.ContainsKey($leaf.ToLowerInvariant())) {
+        $photo = $photoIndex[$leaf.ToLowerInvariant()]
+      }
+      if ($photo) {
+        $ext = [IO.Path]::GetExtension($photo).ToLowerInvariant()
+        if (@(".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp") -contains $ext) {
+          $item = Get-Item -LiteralPath $photo
+          $stamp = $item.LastWriteTimeUtc.ToString("o")
+          $objectName = Get-ImageObjectName $id $ext
+          $exists = $false
+          try { $exists = Test-StorageObject $objectName } catch { $exists = $false }
+          $newer = -not ($imageState.ContainsKey($id) -and $imageState[$id])
+          if (-not $newer) { $newer = $stamp -gt [string]$imageState[$id] }
+          if ((-not $exists) -or $newer) {
+            try {
+              $bytes = [IO.File]::ReadAllBytes($photo)
+              $upload = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Post), ($script:SupabaseUrl.TrimEnd("/") + "/storage/v1/object/product-images/" + [uri]::EscapeDataString($objectName))
+              [void]$upload.Headers.TryAddWithoutValidation("apikey", $script:ServiceKey)
+              [void]$upload.Headers.TryAddWithoutValidation("Authorization", "Bearer $($script:ServiceKey)")
+              [void]$upload.Headers.TryAddWithoutValidation("x-upsert", "true")
+              $content = New-Object System.Net.Http.ByteArrayContent (,$bytes)
+              $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse((Get-ImageContentType $ext))
+              $upload.Content = $content
+              $uploadResp = $script:Http.SendAsync($upload).GetAwaiter().GetResult()
+              $uploadText = $uploadResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+              if (-not $uploadResp.IsSuccessStatusCode) { throw $uploadText }
+              $imageState[$id] = $stamp
+              $images++
+              $exists = $true
+            } catch {
+              $errors++
+              Write-Log "Image $id : $($_.Exception.Message)" "ERROR"
+            }
           }
-        }
-        if ($imageState[$id] -eq $stamp) {
-          $imageUrl = $script:SupabaseUrl.TrimEnd("/") + "/storage/v1/object/public/product-images/" + $fileName
+          if ($exists) {
+            $imageUrl = $script:SupabaseUrl.TrimEnd("/") + "/storage/v1/object/public/product-images/" + [uri]::EscapeDataString($objectName)
+          }
         }
       }
       $productRows.Add(@{
